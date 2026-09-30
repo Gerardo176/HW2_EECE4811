@@ -1,0 +1,98 @@
+#implementation of both locks from figure 28.7 and figure 28.9
+
+#define _GNU_SOURCE
+#include <stdatomic.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <errno.h>
+#include <pthread.h>
+#include <sched.h>
+#include <time.h>
+#include <unistd.h>
+#include <sys/syscall.h>
+#include <linux/futex.h>
+
+/* Linux C11 implementation: no pthread mutexes or condition variables. */
+_Static_assert(sizeof(atomic_int) == 4, "Linux futex requires a 32-bit word");
+static void die(const char *s) { perror(s); exit(1); }
+static void check(int e) { if(e) { errno=e; die("pthread"); } }
+static void relax(void) {
+#if defined(__x86_64__) || defined(__i386__)
+    __asm__ volatile("pause" ::: "memory");
+#else
+    atomic_signal_fence(memory_order_seq_cst);
+#endif
+}
+typedef struct { atomic_uint_fast64_t ticket, turn; } ticket_lock;
+static void ticket_init(ticket_lock *m) {
+    atomic_init(&m->ticket,0); atomic_init(&m->turn,0);
+}
+static void ticket_acquire(ticket_lock *m) {
+    uint_fast64_t mine=atomic_fetch_add_explicit(&m->ticket,1,memory_order_relaxed);
+    while(atomic_load_explicit(&m->turn,memory_order_acquire)!=mine) relax();
+}
+static void ticket_release(ticket_lock *m) {
+    atomic_fetch_add_explicit(&m->turn,1,memory_order_release);
+}
+typedef struct waiter { atomic_int permit; struct waiter *next; } waiter;
+typedef struct { atomic_int guard; int flag; waiter *head,*tail; } queue_lock;
+static void queue_init(queue_lock *m) {
+    atomic_init(&m->guard,0); m->flag=0; m->head=m->tail=NULL;
+}
+static void guard_acquire(queue_lock *m) {
+    while(atomic_exchange_explicit(&m->guard,1,memory_order_acquire)) relax();
+}
+static void guard_release(queue_lock *m) {
+    atomic_store_explicit(&m->guard,0,memory_order_release);
+}
+/* Persistent permit is set before publishing the waiter (setpark equivalent).
+   FUTEX_WAIT atomically checks permit==0 and sleeps. An early unpark sets it
+   to 1, so park cannot lose that wakeup. Always recheck for spurious wakes. */
+static void park_waiter(waiter *w) {
+    while(!atomic_load_explicit(&w->permit,memory_order_acquire)) {
+        long r=syscall(SYS_futex,&w->permit,FUTEX_WAIT_PRIVATE,0,NULL,NULL,0);
+        if(r<0 && errno!=EAGAIN && errno!=EINTR) die("futex wait");
+    }
+}
+static void unpark_waiter(waiter *w) {
+    atomic_store_explicit(&w->permit,1,memory_order_release);
+    if(syscall(SYS_futex,&w->permit,FUTEX_WAKE_PRIVATE,1,NULL,NULL,0)<0)
+        die("futex wake");
+}
+static void queue_acquire(queue_lock *m,waiter *w) {
+    guard_acquire(m);
+    if(!m->flag) { m->flag=1; guard_release(m); return; }
+    atomic_store_explicit(&w->permit,0,memory_order_relaxed); // setpark
+    w->next=NULL;
+    if(m->tail) m->tail->next=w; else m->head=w;
+    m->tail=w;
+    guard_release(m);
+    park_waiter(w);
+}
+static void queue_release(queue_lock *m) {
+    guard_acquire(m);
+    if(!m->head) m->flag=0;
+    else {
+        waiter *w=m->head;
+        m->head=w->next; if(!m->head) m->tail=NULL;
+        /* Keep flag=1: hand ownership directly to oldest waiter.
+           Wake under guard to keep the node alive until syscall completes. */
+        unpark_waiter(w);
+    }
+    guard_release(m);
+}
+static uint64_t now_ns(void) {
+    struct timespec t; if(clock_gettime(CLOCK_MONOTONIC,&t)) die("clock");
+    return (uint64_t)t.tv_sec*1000000000ULL+t.tv_nsec;
+}
+typedef struct {
+    ticket_lock ticket; queue_lock queue;
+    atomic_int ready, go, inside, violations;
+    uint64_t counter, value;
+    int kind, threads, iterations, work, warmup;
+} bench;
+typedef struct { bench *b; waiter w; uint64_t *samples; } worker;
+static void *run_worker(void *p) {
+    worker *a=p; bench *b=a->b;
+    atomic_fetch_add(&b->ready,1);
