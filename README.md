@@ -8,6 +8,7 @@ Q3). When the setpark() is added right before "m->guard = 0;" it solves the "Wak
 
 
 **Code instructions**
+
 Run on Linux with GCC and POSIX threads:
 gcc -O2 -std=c11 -Wall -Wextra -Wpedantic -pthread locks.c -o locks
 taskset -c 0-7 ./locks 5000 5 1000 8 > results.csv
@@ -15,6 +16,7 @@ taskset -c 0-7 ./locks 5000 5 1000 8 > results.csv
 These specify measured acquisitions per thread, trials, protected-work iterations, and maximum thread count. Program tests power of 2 from one-maximum. If IDs 0-7 don't work, choose 8 CPU Ids allowed on local machine.
 
 **Program design**
+
 Waiting time was measured using clock_gettime(CLOCK_MONOTONIC) immediately before and after each lock acquisition, excluding the protected work and unlocking.
 
 Both locks used the same workload: 1,000 integer multiply/add operations and a shared-counter increment inside the critical section. Contention was varied using 1, 2, 4, and 8 threads, with execution restricted to eight CPUs.
@@ -25,7 +27,7 @@ The benchmark recorded mean, median, and percentile waiting times. Each trial al
 
 **Results**
 
-Threads / Lock / Mean wait / SD of means / Median wait / p95 wait / p99 wait
+Threads / Lock / Mean wait / StdDev of means / Median wait / p95 wait / p99 wait
 
 1	/ Ticket / 0.034 / 0.009 / 0.029 / 0.030 / 0.031
 
@@ -44,5 +46,6 @@ Threads / Lock / Mean wait / SD of means / Median wait / p95 wait / p99 wait
 8 / Queue / 185.181 / 14.326 / 119.530 / 459.392 / 1239.089
 
 **Analysis**
-As waiting time increased, so did the contention as well. The ticket lock was faster in this experiment because spinning avoided the queue lock’s sleep and wakeup overhead for a short critical section. However, spinning consumes CPU time, so the queue lock may perform better with longer critical sections or more threads than available CPUs.
+
+There was a direct correlation between waiting time and the thread count, the more threads, the higher the wait time. The ticket lock was faster in this experiment because spinning avoided the queue lock’s sleep and wakeup overhead for a short critical section. However, spinning consumes CPU time, so the queue lock may perform better with longer critical sections or more threads than available CPUs.
 
